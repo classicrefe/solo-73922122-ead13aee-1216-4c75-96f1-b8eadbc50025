@@ -6,6 +6,10 @@
                其中实例 2 通过 ReferencedSOPSequence 引用实例 1，
                并通过 ReferencedStudySequence 引用本研究。
     batch_b/   第二批：新实例引用 batch_a 的 Study/Series/SOP（跨批次引用场景）。
+    interleaved/ 并发交错演示（O/A/B/C + 种子批次）：
+               seed_shared 发布共享 Patient/Study/Series；O 自身 SOP=X；
+               A 自身 SOP=Y 并嵌套引用 X；B 自身 SOP=Z 并嵌套引用 Y；
+               C 自身 SOP=X 并嵌套引用 Z（O 失败后到达）。
     compressed/ 1 份 Deflated 压缩 DICOM，用于验证“压缩文件整批拒绝”。
     bad/       1 份损坏文件，用于验证“坏文件整批拒绝且不留部分批次”。
 
@@ -34,6 +38,15 @@ SOP_A1_UID = "1.2.840.1001.99.1.1.1.1"
 SOP_A2_UID = "1.2.840.1001.99.1.1.2.1"
 # 第二批中“目标尚未入库”的前向引用
 SOP_FUTURE_UID = "1.2.840.1001.99.99.0.0.1"
+
+# 并发交错演示（O/A/B/C）：固定源 UID，保证演示可重复
+ILV_PATIENT_ID = "PAT-DEMO-0002"
+ILV_STUDY_UID = "1.2.840.1001.99.7.1"
+ILV_SERIES_UID = "1.2.840.1001.99.7.1.1"
+ILV_SOP_SEED = "1.2.840.1001.99.7.1.1.9"
+ILV_SOP_X = "1.2.840.1001.99.7.1.1.1"
+ILV_SOP_Y = "1.2.840.1001.99.7.1.1.2"
+ILV_SOP_Z = "1.2.840.1001.99.7.1.1.3"
 
 SOP_CLASS_CT = "1.2.840.10008.5.1.4.1.1.2"  # CT Image Storage
 SOP_CLASS_SR = "1.2.840.10008.5.1.4.1.1.88.11"  # Basic Text SR
@@ -134,6 +147,39 @@ def build_batch_b(out: Path) -> None:
     ds.save_as(out / "b1_cross_batch.dcm", enforce_file_format=True)
 
 
+def build_interleaved(out: Path) -> None:
+    """并发交错演示样例：种子批次 + O/A/B/C 四份单文件批次。
+
+    X/Y/Z 为源 SOP Instance UID：O 自身 X；A 自身 Y 引用 X；B 自身 Z 引用 Y；
+    C 自身 X 引用 Z。配合上传时的可控故障注入（O 保留后挂起再失败），
+    可复现“占映射互相等待”的交错场景。
+    """
+    out.mkdir(parents=True, exist_ok=True)
+
+    seed = _base_ds(ILV_PATIENT_ID, ILV_STUDY_UID, ILV_SERIES_UID, ILV_SOP_SEED,
+                    SOP_CLASS_CT, ExplicitVRLittleEndian)
+    seed.save_as(out / "seed_shared.dcm", enforce_file_format=True)
+
+    o = _base_ds(ILV_PATIENT_ID, ILV_STUDY_UID, ILV_SERIES_UID, ILV_SOP_X,
+                 SOP_CLASS_CT, ExplicitVRLittleEndian)
+    o.save_as(out / "o_own_x.dcm", enforce_file_format=True)
+
+    a = _base_ds(ILV_PATIENT_ID, ILV_STUDY_UID, ILV_SERIES_UID, ILV_SOP_Y,
+                 SOP_CLASS_CT, ExplicitVRLittleEndian)
+    a.ReferencedSOPSequence = Sequence([_ref_sop_item(ILV_SOP_X, SOP_CLASS_CT)])
+    a.save_as(out / "a_refs_x_own_y.dcm", enforce_file_format=True)
+
+    b = _base_ds(ILV_PATIENT_ID, ILV_STUDY_UID, ILV_SERIES_UID, ILV_SOP_Z,
+                 SOP_CLASS_CT, ExplicitVRLittleEndian)
+    b.ReferencedSOPSequence = Sequence([_ref_sop_item(ILV_SOP_Y, SOP_CLASS_CT)])
+    b.save_as(out / "b_refs_y_own_z.dcm", enforce_file_format=True)
+
+    c = _base_ds(ILV_PATIENT_ID, ILV_STUDY_UID, ILV_SERIES_UID, ILV_SOP_X,
+                 SOP_CLASS_CT, ExplicitVRLittleEndian)
+    c.ReferencedSOPSequence = Sequence([_ref_sop_item(ILV_SOP_Z, SOP_CLASS_CT)])
+    c.save_as(out / "c_own_x_refs_z.dcm", enforce_file_format=True)
+
+
 def build_compressed(out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
     ds = _base_ds(PATIENT_ID, STUDY_UID, "1.2.840.1001.99.2.1",
@@ -155,6 +201,7 @@ def main() -> int:
     root = Path(args.out_dir).resolve()
     build_batch_a(root / "batch_a")
     build_batch_b(root / "batch_b")
+    build_interleaved(root / "interleaved")
     build_compressed(root / "compressed")
     build_bad(root / "bad")
     print(f"样例已生成到 {root}")

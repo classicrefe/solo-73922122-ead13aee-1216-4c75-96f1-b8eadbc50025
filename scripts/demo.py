@@ -1,4 +1,4 @@
-"""端到端演示/验收脚本：跨批次引用、同源并发、项目隔离。
+"""端到端演示/验收脚本：跨批次引用、同源并发、项目隔离、并发交错解环。
 
 以隔离模式（python -I）运行，临时数据目录与临时端口启动完整 FastAPI 应用，
 通过 HTTP 上传 scripts/generate_samples.py 生成的样例并断言：
@@ -8,7 +8,9 @@
   3. 同源并发：两个并发批次包含相同源标识，得到相同目标，且都发布成功；
   4. 项目隔离：另一项目的相同源标识得到不同目标；
   5. 压缩文件与坏文件整批拒绝，无部分批次、无映射污染；
-  6. 下载的 ZIP 中 SOP Class UID 与像素字节不变，嵌套引用已替换。
+  6. 下载的 ZIP 中 SOP Class UID 与像素字节不变，嵌套引用已替换；
+  7. 并发交错 + 可控故障：O 占 X 后转换受控失败，A 引用 X/自身 Y、B 引用 Y/自身 Z、
+     C（O 失败后到达）自身 X/引用 Z —— A/B/C 无需重传全部发布，无 60 秒超时解环。
 
 用法：
   python -I scripts/demo.py [--samples data/samples] [--keep]
@@ -17,9 +19,12 @@ from __future__ import annotations
 
 import argparse
 import io
+import os
 import sys
 import tempfile
 import threading
+import time
+import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -28,6 +33,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# 演示需要可控故障注入钩子，必须在导入 app 模块（读取配置）前设置
+os.environ.setdefault("DICOM_REMAP_DEMO_HOOKS", "true")
 
 import httpx  # noqa: E402
 import pydicom  # noqa: E402
@@ -47,6 +55,13 @@ SAMPLE_SOURCE_UIDS = {
 SOP_CLASS_CT = "1.2.840.10008.5.1.4.1.1.2"
 SOP_CLASS_SR = "1.2.840.10008.5.1.4.1.1.88.11"
 
+# 并发交错演示样例的固定源 UID（与 scripts/generate_samples.py 一致）
+ILV_UIDS = {
+    "X": "1.2.840.1001.99.7.1.1.1",
+    "Y": "1.2.840.1001.99.7.1.1.2",
+    "Z": "1.2.840.1001.99.7.1.1.3",
+}
+
 
 class ServerThread(threading.Thread):
     def __init__(self, port: int):
@@ -58,8 +73,13 @@ class ServerThread(threading.Thread):
         server.run()
 
 
-def _upload(client: httpx.Client, base: str, project_id: str, files: list[Path]):
+def _upload(client: httpx.Client, base: str, project_id: str, files: list[Path],
+            demo_hold_seconds: float | None = None, demo_fail: bool = False):
     data = {"project_id": project_id}
+    if demo_hold_seconds is not None:
+        data["demo_hold_seconds"] = str(demo_hold_seconds)
+    if demo_fail:
+        data["demo_fail"] = "true"
     file_payload = [("files", (p.name, p.read_bytes(), "application/dicom")) for p in files]
     return client.post(f"{base}/api/batches", data=data, files=file_payload)
 
@@ -90,7 +110,6 @@ def main() -> int:
         return 2
 
     tmp = Path(tempfile.mkdtemp(prefix="dicom-demo-"))
-    import os
     os.environ["DICOM_REMAP_DATA"] = str(tmp)
     # 各模块持有的是同一个 settings 引用；frozen dataclass 用 object.__setattr__
     # 绕过冻结，db_path/staging_dir/published_dir 均为 property，会立即反映新目录。
@@ -100,7 +119,6 @@ def main() -> int:
     ServerThread(port).start()
     base = f"http://127.0.0.1:{port}"
 
-    import time
     for _ in range(50):
         try:
             if httpx.get(f"{base}/api/health", timeout=1).status_code == 200:
@@ -233,6 +251,65 @@ def main() -> int:
         many = [big] * 21
         r_many = _upload(client, base, proj_a, many)
         check(r_many.status_code in (400, 413), f"超过 20 份被拒绝 (HTTP {r_many.status_code})")
+
+        print("== 场景 7：并发交错 + 可控故障（循环等待修复验证） ==")
+        # 全新项目，保证 X/Y/Z 无任何既有映射；共享标识由种子批次先行发布
+        ilv_proj = client.post(
+            f"{base}/api/projects",
+            data={"name": f"交错演示-{uuid.uuid4().hex[:8]}"},
+        ).json()["id"]
+        ilv = samples / "interleaved"
+        r = _upload(client, base, ilv_proj, [ilv / "seed_shared.dcm"])
+        check(r.status_code == 201, "种子批次发布共享 Patient/Study/Series")
+        shared_before = _mapping_index(client, base, ilv_proj)
+
+        t0 = time.monotonic()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            f_o = pool.submit(_upload, client, base, ilv_proj,
+                              [ilv / "o_own_x.dcm"], 2.0, True)
+            time.sleep(0.4)  # 确保 O 先保留 X
+            f_a = pool.submit(_upload, client, base, ilv_proj,
+                              [ilv / "a_refs_x_own_y.dcm"])
+            time.sleep(0.4)
+            f_b = pool.submit(_upload, client, base, ilv_proj,
+                              [ilv / "b_refs_y_own_z.dcm"])
+            r_o = f_o.result()   # O 受控失败并释放 X
+            # O 失败后 C 到达：自身 X、引用 Z，与重试中的 A 竞争 X
+            f_c = pool.submit(_upload, client, base, ilv_proj,
+                              [ilv / "c_own_x_refs_z.dcm"])
+            r_a, r_b, r_c = f_a.result(), f_b.result(), f_c.result()
+        elapsed = time.monotonic() - t0
+
+        check(r_o.status_code == 500, f"O 转换阶段受控失败 (HTTP {r_o.status_code})")
+        check(r_a.status_code == 201 and r_b.status_code == 201 and r_c.status_code == 201,
+              f"A/B/C 无需重传全部发布 (A={r_a.status_code}, B={r_b.status_code}, C={r_c.status_code})")
+        check(elapsed < 30, f"交错场景总耗时 {elapsed:.1f}s，远低于 60 秒等待上限（未发生超时解环）")
+
+        ilv_map = _mapping_index(client, base, ilv_proj)
+        check(all(ilv_map.get(k) == v for k, v in shared_before.items()),
+              "O 失败未改变任何已发布映射")
+        tx = ilv_map.get(("sop_uid", ILV_UIDS["X"]))
+        ty = ilv_map.get(("sop_uid", ILV_UIDS["Y"]))
+        tz = ilv_map.get(("sop_uid", ILV_UIDS["Z"]))
+        check(all((tx, ty, tz)), "X/Y/Z 各有且仅有一条已发布持久映射")
+
+        batches = client.get(f"{base}/api/batches", params={"project_id": ilv_proj}).json()
+        check(any(b["status"] == "FAILED" for b in batches), "O 批次已标记 FAILED")
+        check(all(b["status"] != "PENDING" for b in batches), "无遗留 PENDING 批次")
+
+        if r_a.status_code == r_b.status_code == r_c.status_code == 201 and all((tx, ty, tz)):
+            ds_a = _download_zip(client, base, r_a.json()["id"])["a_refs_x_own_y.dcm"]
+            check(str(ds_a.SOPInstanceUID) == ty, "A 包自身 SOP == 持久映射 Y 目标")
+            check(str(ds_a.ReferencedSOPSequence[0].ReferencedSOPInstanceUID) == tx,
+                  "A 包嵌套引用 == 持久映射 X 目标")
+            ds_b = _download_zip(client, base, r_b.json()["id"])["b_refs_y_own_z.dcm"]
+            check(str(ds_b.SOPInstanceUID) == tz, "B 包自身 SOP == 持久映射 Z 目标")
+            check(str(ds_b.ReferencedSOPSequence[0].ReferencedSOPInstanceUID) == ty,
+                  "B 包嵌套引用 == 持久映射 Y 目标")
+            ds_c = _download_zip(client, base, r_c.json()["id"])["c_own_x_refs_z.dcm"]
+            check(str(ds_c.SOPInstanceUID) == tx, "C 包自身 SOP == 持久映射 X 目标")
+            check(str(ds_c.ReferencedSOPSequence[0].ReferencedSOPInstanceUID) == tz,
+                  "C 包嵌套引用 == 持久映射 Z 目标")
 
     print()
     if failures:

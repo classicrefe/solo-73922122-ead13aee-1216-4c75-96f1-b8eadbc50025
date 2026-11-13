@@ -83,12 +83,23 @@ def post_project(name: str = Form(...)):
 async def create_batch(
     project_id: str = Form(...),
     files: list[UploadFile] = File(..., description="最多 20 份、合计 ≤16 MiB 的未压缩 DICOM"),
+    demo_hold_seconds: float = Form(0.0, description="演示钩子：保留成功后挂起秒数"),
+    demo_fail: bool = Form(False, description="演示钩子：转换阶段受控失败"),
 ):
     conn = db.connect()
     try:
         _get_project_or_404(conn, project_id)
     finally:
         conn.close()
+
+    # 演示钩子仅在服务端启用时生效，否则静默忽略，不影响正常上传
+    hold_seconds = 0.0
+    fail = False
+    if settings.demo_hooks_enabled:
+        hold_seconds = max(
+            0.0, min(float(demo_hold_seconds or 0.0), settings.demo_max_hold_seconds)
+        )
+        fail = bool(demo_fail)
 
     # 先在请求层做总量限制，避免超大上传耗尽内存
     payload: list[UploadedFile] = []
@@ -115,7 +126,9 @@ async def create_batch(
     try:
         # 转换为 CPU/文件密集型同步流水线，放到线程池执行，避免阻塞事件循环，
         # 保证多批次 HTTP 请求能真正并发进入保留协议。
-        batch_id = await run_in_threadpool(process_batch, project_id, payload)
+        batch_id = await run_in_threadpool(
+            process_batch, project_id, payload, hold_seconds, fail
+        )
     except UploadLimitError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
     except DicomValidationError as exc:
@@ -201,7 +214,31 @@ def get_meta():
         "max_total_bytes": settings.max_total_bytes,
         "max_total_mib": settings.max_total_bytes / (1024 * 1024),
         "id_kinds": ID_KINDS,
+        "lock_wait_seconds": settings.lock_wait_seconds,
+        "demo_hooks_enabled": settings.demo_hooks_enabled,
     }
+
+
+@app.post("/api/demo/interleaved")
+def post_interleaved_demo(project_id: str = Form(...)):
+    """并发交错演示（O/A/B/C + 可控故障注入），仅在演示钩子启用时可用。
+
+    在指定项目内生成全新源 UID 并完整跑一遍交错场景，返回时间线、
+    X/Y/Z 持久映射归属与一致性校验结果。
+    """
+    if not settings.demo_hooks_enabled:
+        raise HTTPException(
+            status_code=404,
+            detail="演示钩子未启用（设置 DICOM_REMAP_DEMO_HOOKS=true 后重启服务）",
+        )
+    conn = db.connect()
+    try:
+        _get_project_or_404(conn, project_id)
+    finally:
+        conn.close()
+    from . import demo
+
+    return demo.run_interleaved_demo(project_id)
 
 
 # 静态前端（挂载在最后，避免覆盖 /api 路由）

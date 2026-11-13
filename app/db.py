@@ -1,11 +1,15 @@
 """SQLite 持久层：项目、批次、映射与并发保留协议。
 
-并发模型（保证“并发批次不能给同一源标识分配不同结果”）：
+并发模型（保证“并发批次不能给同一源标识分配不同结果”，且交叉引用不会循环等待）：
   1. 保留阶段在单条 ``BEGIN IMMEDIATE`` 事务（持有写锁，毫秒级）内：
      - 登记 PENDING 批次；
      - 对每个源标识 ``INSERT OR IGNORE`` 一条 PENDING 映射；
-     - 已存在但属他批次且仍 PENDING 时，本批次稍后轮询等待；
-     - 已存在且 PUBLISHED 时直接复用。
+     - 已存在且 PUBLISHED 时直接复用；
+     - 已存在但属他批次且仍 PENDING 时：**同事务内删除本批次全部 PENDING 保留**
+       （“阻塞即让路”），随后在不持写锁的轮询中等待对方发布/回收，再整轮重试。
+     等待中的批次不持有任何映射，等待图中不存在“持映射等待”的节点，循环等待
+     （如 A 占 Y 等 X、B 占 Z 等 Y、C 占 X 等 Z）在结构上不可能出现；
+     60 秒等待上限仅作为异常兜底保留，正常路径远在其内完成。
   2. 转换阶段不持任何数据库事务/写锁（纯文件 CPU 工作）。
   3. 发布阶段再用单条写事务把本批次与本批次新建映射一并置为 PUBLISHED。
 任何失败/中断：本批次 PENDING 映射与 PENDING 批次被回收（启动恢复或即时失败处理），
@@ -158,19 +162,28 @@ def reserve_mappings(
     batch_id: str,
     requested: dict[str, list[str]],
 ) -> dict[str, dict[str, str]]:
-    """为批次保留全部源标识的映射。
+    """为批次保留全部源标识的映射（“阻塞即让路”，结构上杜绝循环等待）。
 
     ``requested``: {id_kind: [去重后的源值...]}
     返回 {id_kind: {source_value: target_value}}，包含复用的已发布映射与新保留映射。
 
-    转换期不持锁：本函数返回后即释放事务，调用方拿返回表做纯文件转换。
-    他批次持有的 PENDING 冲突会在锁内/锁后轮询等待，保证同一源标识永远得到同一目标。
+    协议：
+      * 每轮在一条 ``BEGIN IMMEDIATE`` 短事务内尝试保留全部仍未解析的源标识；
+      * 若任一源被他批次以 PENDING 持有，则**同事务内删除本批次全部 PENDING
+        保留**并提交（等待者不持有任何映射，等待图无环），随后在不持写锁的
+        轮询中等待对方发布或失败回收，再整轮重试；
+      * 已 PUBLISHED 的映射直接复用，保证同一源标识永远得到同一目标；
+      * 转换期不持锁：本函数返回后即释放事务，调用方拿返回表做纯文件转换；
+      * 等待总时长受 ``settings.lock_wait_seconds``（默认 60 秒）限制；超时抛出
+        ``TimeoutError``，此时本批次不持有任何 PENDING 映射，无需额外回滚。
     """
     deadline = time.monotonic() + settings.lock_wait_seconds
     result: dict[str, dict[str, str]] = {kind: {} for kind in ID_KINDS}
     pending: dict[str, list[str]] = {
         kind: list(dict.fromkeys(requested.get(kind, []))) for kind in ID_KINDS
     }
+    # 本批次当前持有的 PENDING 映射；阻塞时必须全部让出，避免“占着映射等别人”
+    mine: set[tuple[str, str]] = set()
 
     while True:
         blocked: list[tuple[str, str]] = []
@@ -184,40 +197,53 @@ def reserve_mappings(
             for kind in ID_KINDS:
                 remaining: list[str] = []
                 for source in pending[kind]:
-                    existing = conn.execute(
+                    row = conn.execute(
                         "SELECT target_value, status, created_batch_id FROM id_mappings "
                         "WHERE project_id=? AND id_kind=? AND source_value=?",
                         (project_id, kind, source),
                     ).fetchone()
-                    if existing is None:
-                        target = _generate_target(kind)
+                    if row is None:
                         conn.execute(
                             "INSERT OR IGNORE INTO id_mappings"
                             "(project_id, id_kind, source_value, target_value, status, created_batch_id) "
                             "VALUES (?,?,?,?, 'PENDING', ?)",
-                            (project_id, kind, source, target, batch_id),
+                            (project_id, kind, source, _generate_target(kind), batch_id),
                         )
                         row = conn.execute(
-                            "SELECT target_value, status FROM id_mappings "
+                            "SELECT target_value, status, created_batch_id FROM id_mappings "
                             "WHERE project_id=? AND id_kind=? AND source_value=?",
                             (project_id, kind, source),
                         ).fetchone()
+                    if row["status"] == "PUBLISHED":
+                        # 已发布映射直接复用（含 INSERT 被唯一约束忽略的竞态）
                         result[kind][source] = row["target_value"]
-                        if row["status"] == "PUBLISHED":
-                            # 竞态：插入被唯一约束忽略且他端刚发布，直接复用
-                            continue
-                    elif existing["status"] == "PUBLISHED":
-                        result[kind][source] = existing["target_value"]
+                    elif row["created_batch_id"] == batch_id:
+                        # 本批次新建并持有的 PENDING 保留
+                        result[kind][source] = row["target_value"]
+                        mine.add((kind, source))
                     else:
-                        # 他批次 PENDING：本批次等待
+                        # 他批次 PENDING：本批次让路后等待
                         blocked.append((kind, source))
                         remaining.append(source)
                 pending[kind] = remaining
 
+            if blocked and mine:
+                # 阻塞即让路：同事务释放本批次全部 PENDING 保留，相关源回到
+                # 待保留集合。等待期间本批次不持有任何映射，循环等待无从形成。
+                conn.execute(
+                    "DELETE FROM id_mappings "
+                    "WHERE created_batch_id=? AND status='PENDING'",
+                    (batch_id,),
+                )
+                for kind, source in mine:
+                    result[kind].pop(source, None)
+                    pending[kind].append(source)
+                mine.clear()
+
         if not blocked:
             return result
 
-        # 不持锁轮询，等待持有者发布或失败回收
+        # 不持任何事务/写锁轮询，等待持有者发布或失败回收
         while time.monotonic() < deadline:
             time.sleep(0.1)
             still_blocked: list[tuple[str, str]] = []
@@ -241,7 +267,7 @@ def reserve_mappings(
             raise TimeoutError(
                 "等待并发批次的标识映射超时；为保证同一源标识不产生不同结果，本批次中止"
             )
-        # 仍 blocked 且未超时（理论上 blocked 为空才会 break），继续下一轮保留
+        # 仍有源未解析（持有者释放或刚发布），整轮重试保留
 
 
 def publish_batch(
@@ -320,12 +346,16 @@ def recover_pending(conn: sqlite3.Connection) -> list[str]:
 # 查询
 # --------------------------------------------------------------------------- #
 def list_batches(conn: sqlite3.Connection, project_id: str | None = None) -> list[sqlite3.Row]:
+    # created_at 精度为秒，同秒并列时以 rowid（插入序）保证“最新批次在前”确定性
     if project_id:
         return conn.execute(
-            "SELECT * FROM batches WHERE project_id=? ORDER BY created_at DESC",
+            "SELECT * FROM batches WHERE project_id=? "
+            "ORDER BY created_at DESC, rowid DESC",
             (project_id,),
         ).fetchall()
-    return conn.execute("SELECT * FROM batches ORDER BY created_at DESC").fetchall()
+    return conn.execute(
+        "SELECT * FROM batches ORDER BY created_at DESC, rowid DESC"
+    ).fetchall()
 
 
 def get_batch(conn: sqlite3.Connection, batch_id: str) -> sqlite3.Row | None:

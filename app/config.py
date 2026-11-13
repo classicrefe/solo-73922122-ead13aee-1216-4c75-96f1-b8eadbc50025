@@ -11,6 +11,13 @@ def _int_env(name: str, default: int) -> int:
     return int(raw) if raw not in (None, "") else default
 
 
+def _bool_env(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw in (None, ""):
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path = Path(os.environ.get("DICOM_REMAP_DATA", "/data"))
@@ -19,6 +26,10 @@ class Settings:
     max_total_bytes: int = _int_env("DICOM_REMAP_MAX_TOTAL_BYTES", 16 * 1024 * 1024)
     # 并发批次等待对端提交/放弃的最长轮询时间（秒）
     lock_wait_seconds: int = _int_env("DICOM_REMAP_LOCK_WAIT", 60)
+    # 演示钩子：允许上传时注入“保留后挂起/受控失败”，用于复现并发交错场景
+    demo_hooks_enabled: bool = _bool_env("DICOM_REMAP_DEMO_HOOKS", False)
+    # 演示钩子允许的最大挂起秒数（防止滥用）
+    demo_max_hold_seconds: float = 30.0
     db_filename: str = "registry.db"
 
     @property

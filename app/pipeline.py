@@ -1,4 +1,4 @@
-"""批次处理流水线：校验 -> 映射保留（短写锁）-> 转换（不持锁）-> 原子发布。
+"""批次处理流水线：校验 -> 映射保留（短写锁，阻塞即让路）-> 转换（不持锁）-> 原子发布。
 
 暂存与发布目录布局::
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import time
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -102,8 +103,18 @@ def recover_on_startup() -> list[str]:
     return stale
 
 
-def process_batch(project_id: str, files: list[UploadedFile]) -> str:
-    """同步处理一个批次，返回 batch_id。任何异常都保证不留部分批次。"""
+def process_batch(
+    project_id: str,
+    files: list[UploadedFile],
+    demo_hold_seconds: float = 0.0,
+    demo_fail: bool = False,
+) -> str:
+    """同步处理一个批次，返回 batch_id。任何异常都保证不留部分批次。
+
+    ``demo_hold_seconds`` / ``demo_fail`` 仅在演示钩子启用
+    （``settings.demo_hooks_enabled``）时生效，用于复现“保留成功后转换期
+    挂起/失败”的并发交错场景；失败回收路径与真实转换失败完全一致。
+    """
     validate_upload_bundle(files)
     batch_id = str(uuid.uuid4())
     work_dir = _staging_dir(batch_id)
@@ -133,19 +144,28 @@ def process_batch(project_id: str, files: list[UploadedFile]) -> str:
         for kind in ID_KINDS
     }
 
-    # ---- 阶段 2：短写锁内保留映射（含对并发批次的等待），返回后立即放锁 ------ #
+    # ---- 阶段 2：短写锁内保留映射（阻塞即让路 + 锁外等待重试），返回后放锁 --- #
     conn = db.connect()
     try:
         mapping = db.reserve_mappings(conn, project_id, batch_id, requested)
-    except Exception:
+    except Exception as exc:
         conn.close()
-        cleanup_staging(batch_id)
+        # 保留阶段失败（含等待超时）：批次行可能已登记，按失败回收，
+        # 保证不留 PENDING 批次/映射（已发布映射不受影响）。
+        _abort(batch_id, f"标识映射保留失败: {exc}")
         raise
 
     # ---- 阶段 3：转换，不持有任何数据库事务/写锁 ----------------------------- #
     file_records: list[dict] = []
     total_out = 0
     try:
+        # 受控故障注入（仅演示钩子启用时）：模拟“保留成功后转换阶段挂起/失败”，
+        # 走与真实转换失败完全相同的回收路径（释放本批次 PENDING 映射）。
+        if settings.demo_hooks_enabled and (demo_hold_seconds > 0 or demo_fail):
+            if demo_hold_seconds > 0:
+                time.sleep(min(demo_hold_seconds, settings.demo_max_hold_seconds))
+            if demo_fail:
+                raise RuntimeError("受控故障注入：模拟转换阶段失败")
         for parsed in parsed_files:
             encoded = remap_to_bytes(parsed, mapping)
             entry = safe_filename(parsed.filename)

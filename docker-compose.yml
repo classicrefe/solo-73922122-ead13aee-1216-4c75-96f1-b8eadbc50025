@@ -11,6 +11,9 @@ services:
       DICOM_REMAP_MAX_TOTAL_BYTES: "16777216"
       DICOM_REMAP_LOCK_WAIT: "60"
       GENERATE_SAMPLES: "true"
+      # 演示钩子：开启后网页可一键运行“并发交错 + 可控故障”演示
+      # （POST /api/demo/interleaved），生产部署可设为 false 关闭
+      DICOM_REMAP_DEMO_HOOKS: "true"
     volumes:
       - dicom-data:/data
     restart: unless-stopped

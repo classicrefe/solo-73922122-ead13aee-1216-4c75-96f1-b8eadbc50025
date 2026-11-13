@@ -105,9 +105,26 @@
     <div class="msg" id="uploadMsg"></div>
   </section>
 
+  <section class="card" id="demoCard" style="display:none;">
+    <h2>② 并发交错演示：循环等待修复（可控故障注入）</h2>
+    <p class="hint" style="margin:0 0 10px;">
+      同一项目四批次交错上传：<b>O</b> 占用源 SOP <b>X</b> 后转换受控失败；
+      <b>A</b> 引用 X、自身为 <b>Y</b>；<b>B</b> 引用 Y、自身为 <b>Z</b>；
+      O 失败释放 X 后 <b>C</b> 到达，自身为 X、引用 Z。
+      旧“占用-等待”协议下 A 占 Y 等 X、B 占 Z 等 Y、C 占 X 等 Z —— 循环等待直至 60 秒超时；
+      现协议“阻塞即让路”（等待前释放自己的 PENDING 保留、锁外等待重试），
+      A/B/C <b>无需重传</b>即可全部发布，且共享源标识之外的批次仍可并行转换。
+    </p>
+    <div class="row">
+      <button id="runDemo" type="button">▶ 在当前项目运行交错演示</button>
+      <span class="hint" id="demoStatus"></span>
+    </div>
+    <div id="demoResult" style="margin-top:12px;"></div>
+  </section>
+
   <div class="grid2">
     <section class="card">
-      <h2>② 批次记录</h2>
+      <h2>③ 批次记录</h2>
       <div class="tabs">
         <button data-view="batches" class="active" type="button">批次</button>
         <button data-view="mappings" type="button">已发布映射</button>
@@ -130,7 +147,7 @@
     </section>
 
     <section class="card">
-      <h2>③ 批次详情</h2>
+      <h2>④ 批次详情</h2>
       <div id="detail" class="hint">点击批次行查看详情与下载链接</div>
     </section>
   </div>
@@ -163,6 +180,62 @@ async function loadMeta() {
   meta = await api("/api/meta");
   $("limitHint").textContent =
     `单批最多 ${meta.max_files} 份，合计 ≤ ${meta.max_total_mib} MiB；坏文件或超限整批拒绝`;
+  if (meta.demo_hooks_enabled) $("demoCard").style.display = "";
+}
+
+$("runDemo").addEventListener("click", async () => {
+  const btn = $("runDemo");
+  btn.disabled = true;
+  $("demoStatus").textContent = "演示运行中（约 3 秒）…";
+  $("demoResult").innerHTML = "";
+  try {
+    const body = new FormData();
+    body.append("project_id", $("project").value);
+    const r = await api("/api/demo/interleaved", { method: "POST", body });
+    renderDemo(r);
+    await loadBatches();
+  } catch (err) {
+    $("demoResult").innerHTML =
+      `<div class="msg err">演示失败：${err.message}</div>`;
+  } finally {
+    btn.disabled = false;
+    $("demoStatus").textContent = "";
+  }
+});
+
+function renderDemo(r) {
+  const steps = r.steps.map(s =>
+    `<tr><td>${s.t.toFixed(2)}s</td><td><b>${s.actor}</b></td><td>${s.action}</td></tr>`
+  ).join("");
+  const maps = r.mappings.map(m =>
+    `<tr><td><b>${m.role}</b></td><td><code>${m.source_value}</code></td>` +
+    `<td><code>${m.target_value}</code></td><td>${m.created_by}</td></tr>`
+  ).join("");
+  const checks = r.checks.map(c =>
+    `<div>${c.ok ? "✅" : "❌"} ${c.label}</div>`).join("");
+  const batchCells = ["O", "A", "B", "C"].map(role => {
+    const b = r.batches[role] || {};
+    const id = b.batch_id
+      ? `<code>${b.batch_id.slice(0, 8)}…</code>` : "—";
+    return `<tr><td><b>${role}</b></td>` +
+      `<td><span class="pill ${b.status}">${b.status}</span></td>` +
+      `<td>${b.elapsed != null ? b.elapsed + "s" : "—"}</td><td>${id}</td></tr>`;
+  }).join("");
+  $("demoResult").innerHTML = `
+    <div class="msg ${r.ok ? "ok" : "err"}">
+      ${r.ok ? "演示通过" : "演示未通过"}：A/B/C 无需重传全部发布，
+      总耗时 ${r.elapsed_seconds}s（等待上限 ${r.lock_wait_seconds}s，未触发超时解环）
+    </div>
+    <table><thead><tr><th>角色</th><th>状态</th><th>耗时</th><th>批次</th></tr></thead>
+      <tbody>${batchCells}</tbody></table>
+    <div class="hint" style="margin:10px 0 4px;">时间线</div>
+    <table><thead><tr><th>t</th><th>角色</th><th>事件</th></tr></thead>
+      <tbody>${steps}</tbody></table>
+    <div class="hint" style="margin:10px 0 4px;">X/Y/Z 持久映射（同项目同源沿用同值）</div>
+    <table><thead><tr><th>源</th><th>源 SOP UID</th><th>目标 SOP UID</th><th>映射创建者</th></tr></thead>
+      <tbody>${maps}</tbody></table>
+    <div class="hint" style="margin:10px 0 4px;">一致性校验</div>
+    <div style="font-size:13px;">${checks}</div>`;
 }
 
 async function loadProjects(selectId) {
